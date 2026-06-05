@@ -1,22 +1,40 @@
 import { GT } from "@graphql/index"
 
+// FIP-07 fine-grained scopes. GraphQL enum names can't contain ":",
+// so the names use "_" while the serialized values keep the FIP-07 form.
 const ApiTokenScope = GT.Enum({
   name: "ApiTokenScope",
-  description: "Permission scopes for API tokens",
+  description: "Permission scopes for API tokens (FIP-07)",
   values: {
-    read: {
-      value: "read",
-      description: "Read-only access to account data"
+    read_wallet: {
+      value: "read:wallet",
+      description: "Read wallet balances and details",
     },
-    write: {
-      value: "write", 
-      description: "Read and write access to perform operations"
+    write_wallet: {
+      value: "write:wallet",
+      description: "Perform wallet operations (send/receive)",
+    },
+    read_transactions: {
+      value: "read:transactions",
+      description: "Read transaction history",
+    },
+    write_transactions: {
+      value: "write:transactions",
+      description: "Create transactions",
+    },
+    read_user: {
+      value: "read:user",
+      description: "Read-only access to user/account data",
+    },
+    write_user: {
+      value: "write:user",
+      description: "Modify user/account data",
     },
     admin: {
       value: "admin",
-      description: "Full administrative access"
-    }
-  }
+      description: "Full administrative access",
+    },
+  },
 })
 
 export default ApiTokenScope

@@ -1,11 +1,15 @@
-import { createHash } from "crypto"
+import { createHash, timingSafeEqual } from "crypto"
+
 // AccountId is a global type from domain/primitives/index.types.d.ts
-import { ApiTokenScope, toApiTokenHash } from "@domain/api-tokens/index.types"
+import {
+  ApiTokenScope,
+  API_KEY_PREFIX,
+  toApiTokenKeyId,
+} from "@domain/api-tokens/index.types"
 import { ApiTokensRepository } from "@services/mongoose/api-tokens"
 import { addAttributesToCurrentSpan } from "@services/tracing"
 import { getAccount } from "@app/accounts"
 import { baseLogger } from "@services/logger"
-import { getApiTokenConfig } from "@config"
 
 export interface ApiTokenAuth {
   accountId: AccountId
@@ -13,141 +17,142 @@ export interface ApiTokenAuth {
   tokenId: string
 }
 
+// Matches "fk_{8-hex-keyId}_{secret}" — keyId is hex so the split is unambiguous
+const TOKEN_RE = new RegExp(`^${API_KEY_PREFIX}_([0-9a-f]{8})_(.+)$`)
+
 /**
- * Validates an API token from the Authorization header
- * Returns account information if valid, null otherwise
+ * Validates an API token from the Authorization header.
+ * Returns account information if valid, null otherwise.
+ *
+ * Note: IP-constraint and usage-log enforcement are separate FIP-07 tickets;
+ * this performs the keyId lookup + constant-time secret verification.
  */
 export const validateApiToken = async (
-  authHeader: string | undefined
+  authHeader: string | undefined,
 ): Promise<ApiTokenAuth | null> => {
-  
-  const config = getApiTokenConfig()
-  const tokenPrefix = config.tokenPrefix || "flash_"
-  
-  // Check for API token format: "Bearer <prefix><token>"
-  const expectedStart = `Bearer ${tokenPrefix}`
-  if (!authHeader?.startsWith(expectedStart)) {
+  const bearerPrefix = "Bearer "
+  if (!authHeader?.startsWith(`${bearerPrefix}${API_KEY_PREFIX}_`)) {
     return null
   }
-  
+
   try {
-    // Extract the token (remove "Bearer " and prefix)
-    const rawToken = authHeader.substring(expectedStart.length)
-    
-    
-    // Hash the token for database lookup
-    const tokenHash = createHash('sha256').update(rawToken).digest('hex')
-    
+    const rawToken = authHeader.substring(bearerPrefix.length)
+    const match = TOKEN_RE.exec(rawToken)
+    if (!match) {
+      return null
+    }
+    const keyId = match[1]
+    const secret = match[2]
+
     addAttributesToCurrentSpan({
       "auth.apiToken.attempt": true,
-      "auth.apiToken.hashPrefix": tokenHash.substring(0, 8) // Log prefix only for debugging
+      "auth.apiToken.keyId": keyId,
     })
-    
-    // Look up token in database
+
+    // Look up by public keyId (single indexed read)
     const apiTokensRepo = ApiTokensRepository()
-    const apiToken = await apiTokensRepo.findByTokenHash(toApiTokenHash(tokenHash))
-    
-    // Check if token exists and is valid
+    const apiToken = await apiTokensRepo.findByKeyId(toApiTokenKeyId(keyId))
+
     if (apiToken instanceof Error) {
-      addAttributesToCurrentSpan({ 
-        "auth.apiToken.notFound": true 
-      })
+      addAttributesToCurrentSpan({ "auth.apiToken.notFound": true })
       return null
     }
-    
-    // Check if token is active
-    if (!apiToken.active) {
-      addAttributesToCurrentSpan({ 
-        "auth.apiToken.inactive": true 
-      })
+
+    // Constant-time comparison of the SHA-256 hashes
+    const presentedHash = createHash("sha256").update(secret).digest("hex")
+    const a = Buffer.from(presentedHash, "hex")
+    const b = Buffer.from(apiToken.hashedKey, "hex")
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      addAttributesToCurrentSpan({ "auth.apiToken.badSecret": true })
       return null
     }
-    
-    // Check if token has expired
+
+    // Status check (findByKeyId already filters active, kept for safety)
+    if (apiToken.status !== "active") {
+      addAttributesToCurrentSpan({ "auth.apiToken.inactive": true })
+      return null
+    }
+
+    // Expiry check
     if (apiToken.expiresAt && apiToken.expiresAt < new Date()) {
-      addAttributesToCurrentSpan({ 
-        "auth.apiToken.expired": true 
-      })
+      addAttributesToCurrentSpan({ "auth.apiToken.expired": true })
       return null
     }
-    
-    // Update last used timestamp asynchronously with single try-catch (best effort)
-    (async () => {
+
+    // Update last used timestamp asynchronously (best effort)
+    ;(async () => {
       try {
         await apiTokensRepo.updateLastUsed(apiToken.id)
       } catch (err) {
         baseLogger.error(
           { err, apiTokenId: apiToken.id },
-          "Failed to update API token last used timestamp"
+          "Failed to update API token last used timestamp",
         )
-        addAttributesToCurrentSpan({
-          "auth.apiToken.updateLastUsedFailed": true
-        })
+        addAttributesToCurrentSpan({ "auth.apiToken.updateLastUsedFailed": true })
       }
     })()
-    
+
     addAttributesToCurrentSpan({
       "auth.apiToken.success": true,
       "auth.apiToken.accountId": apiToken.accountId,
       "auth.apiToken.scopes": apiToken.scopes.join(","),
-      "auth.apiToken.tokenId": apiToken.id
+      "auth.apiToken.tokenId": apiToken.id,
     })
-    
+
     return {
       accountId: apiToken.accountId,
       scopes: apiToken.scopes,
-      tokenId: apiToken.id
+      tokenId: apiToken.id,
     }
   } catch (err) {
     baseLogger.error(err, "Error validating API token")
-    addAttributesToCurrentSpan({ 
+    addAttributesToCurrentSpan({
       "auth.apiToken.error": true,
-      "auth.apiToken.errorMessage": err instanceof Error ? err.message : "Unknown error"
+      "auth.apiToken.errorMessage": err instanceof Error ? err.message : "Unknown error",
     })
     return null
   }
 }
 
 /**
- * Check if the API token has the required scope for an operation
+ * Check if the API token has the required scope for an operation.
+ * - `admin` grants everything
+ * - `write:X` implies `read:X`
  */
 export const hasApiTokenScope = (
   scopes: ApiTokenScope[],
-  requiredScope: ApiTokenScope
+  requiredScope: ApiTokenScope,
 ): boolean => {
-  // Admin scope has access to everything
   if (scopes.includes("admin")) {
     return true
   }
-  
-  // Write scope includes read permissions
-  if (requiredScope === "read" && scopes.includes("write")) {
-    return true
+
+  // A write scope implies the matching read scope
+  if (requiredScope.startsWith("read:")) {
+    const resource = requiredScope.slice("read:".length)
+    if (scopes.includes(`write:${resource}` as ApiTokenScope)) {
+      return true
+    }
   }
-  
-  // Check for exact scope match
+
   return scopes.includes(requiredScope)
 }
 
 /**
  * Get account context from API token authentication
  */
-export const getApiTokenAccountContext = async (
-  auth: ApiTokenAuth
-) => {
+export const getApiTokenAccountContext = async (auth: ApiTokenAuth) => {
   const account = await getAccount(auth.accountId)
-  
+
   if (account instanceof Error) {
-    addAttributesToCurrentSpan({ 
-      "auth.apiToken.accountNotFound": true 
-    })
+    addAttributesToCurrentSpan({ "auth.apiToken.accountNotFound": true })
     return null
   }
-  
+
   return {
     domainAccount: account,
     isApiToken: true,
     apiTokenScopes: auth.scopes,
-    apiTokenId: auth.tokenId
+    apiTokenId: auth.tokenId,
   }
 }
