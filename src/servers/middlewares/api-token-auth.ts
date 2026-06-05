@@ -24,8 +24,9 @@ const TOKEN_RE = new RegExp(`^${API_KEY_PREFIX}_([0-9a-f]{8})_(.+)$`)
  * Validates an API token from the Authorization header.
  * Returns account information if valid, null otherwise.
  *
- * Note: IP-constraint and usage-log enforcement are separate FIP-07 tickets;
- * this performs the keyId lookup + constant-time secret verification.
+ * Note: IP-constraint enforcement and rich usage logging (IP / user-agent /
+ * rate-limit metrics) are separate FIP-07 tickets; this performs the keyId
+ * lookup + constant-time secret verification and records a minimal usage entry.
  */
 export const validateApiToken = async (
   authHeader: string | undefined,
@@ -67,28 +68,27 @@ export const validateApiToken = async (
       return null
     }
 
-    // Status check (findByKeyId already filters active, kept for safety)
-    if (apiToken.status !== "active") {
-      addAttributesToCurrentSpan({ "auth.apiToken.inactive": true })
-      return null
-    }
-
-    // Expiry check
+    // Expiry check (findByKeyId already filters out non-active tokens)
     if (apiToken.expiresAt && apiToken.expiresAt < new Date()) {
       addAttributesToCurrentSpan({ "auth.apiToken.expired": true })
       return null
     }
 
-    // Update last used timestamp asynchronously (best effort)
+    // Record usage asynchronously (best effort): refreshes lastUsedAt and
+    // appends a capped usage entry.
     ;(async () => {
       try {
-        await apiTokensRepo.updateLastUsed(apiToken.id)
+        await apiTokensRepo.recordUsage(apiToken.id, {
+          timestamp: new Date(),
+          operation: "auth",
+          result: "success",
+        })
       } catch (err) {
         baseLogger.error(
           { err, apiTokenId: apiToken.id },
-          "Failed to update API token last used timestamp",
+          "Failed to record API token usage",
         )
-        addAttributesToCurrentSpan({ "auth.apiToken.updateLastUsedFailed": true })
+        addAttributesToCurrentSpan({ "auth.apiToken.recordUsageFailed": true })
       }
     })()
 

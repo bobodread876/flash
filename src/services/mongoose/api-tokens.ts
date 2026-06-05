@@ -1,4 +1,4 @@
-import { Schema, model } from "mongoose"
+import { Schema, model, Types } from "mongoose"
 import {
   ApiTokenId,
   ApiTokenKeyId,
@@ -73,7 +73,7 @@ const ApiTokenModel = model("ApiToken", ApiTokenSchema)
 
 // MongoDB Document interface
 interface ApiTokenDocument {
-  _id: unknown
+  _id: Types.ObjectId
   keyId: string
   accountId: string
   name: string
@@ -91,7 +91,7 @@ interface ApiTokenDocument {
 // Translation functions
 const translateToApiToken = (doc: ApiTokenDocument): IApiToken => {
   return {
-    id: toApiTokenId(fromObjectId(doc._id as never)),
+    id: toApiTokenId(fromObjectId(doc._id)),
     keyId: toApiTokenKeyId(doc.keyId),
     accountId: doc.accountId as AccountId,
     name: doc.name as ApiTokenName,
@@ -112,7 +112,8 @@ export interface IApiTokensRepository {
   create(token: NewApiToken): Promise<IApiToken | RepositoryError>
   findByKeyId(keyId: ApiTokenKeyId): Promise<IApiToken | RepositoryError>
   findByAccountId(accountId: AccountId): Promise<IApiToken[] | RepositoryError>
-  updateLastUsed(id: ApiTokenId): Promise<void | RepositoryError>
+  // Appends a usage entry (keeping only the most recent
+  // API_TOKEN_USAGE_LOG_LIMIT) and refreshes lastUsedAt.
   recordUsage(id: ApiTokenId, entry: ApiTokenUsageLog): Promise<void | RepositoryError>
   revoke(id: ApiTokenId): Promise<IApiToken | RepositoryError>
   revokeAll(accountId: AccountId): Promise<number | RepositoryError>
@@ -135,7 +136,7 @@ export const ApiTokensRepository = (): IApiTokensRepository => {
           status: "active",
         })
 
-        return translateToApiToken(doc as unknown as ApiTokenDocument)
+        return translateToApiToken(doc)
       } catch (err) {
         return new UnknownRepositoryError(err)
       }
@@ -149,7 +150,7 @@ export const ApiTokensRepository = (): IApiTokensRepository => {
           return new CouldNotFindError("API token not found")
         }
 
-        return translateToApiToken(doc as unknown as ApiTokenDocument)
+        return translateToApiToken(doc)
       } catch (err) {
         return new UnknownRepositoryError(err)
       }
@@ -164,18 +165,7 @@ export const ApiTokensRepository = (): IApiTokensRepository => {
           status: "active",
         }).sort({ createdAt: -1 })
 
-        return docs.map((d) => translateToApiToken(d as unknown as ApiTokenDocument))
-      } catch (err) {
-        return new UnknownRepositoryError(err)
-      }
-    },
-
-    updateLastUsed: async (id: ApiTokenId): Promise<void | RepositoryError> => {
-      try {
-        await ApiTokenModel.updateOne(
-          { _id: toObjectId(id) },
-          { $set: { lastUsedAt: new Date() } },
-        )
+        return docs.map((doc) => translateToApiToken(doc))
       } catch (err) {
         return new UnknownRepositoryError(err)
       }
@@ -191,10 +181,7 @@ export const ApiTokensRepository = (): IApiTokensRepository => {
           {
             $set: { lastUsedAt: entry.timestamp ?? new Date() },
             $push: {
-              usageLogs: {
-                $each: [entry],
-                $slice: -API_TOKEN_USAGE_LOG_LIMIT,
-              },
+              usageLogs: { $each: [entry], $slice: -API_TOKEN_USAGE_LOG_LIMIT },
             },
           },
         )
@@ -215,7 +202,7 @@ export const ApiTokensRepository = (): IApiTokensRepository => {
           return new CouldNotFindError("API token not found")
         }
 
-        return translateToApiToken(doc as unknown as ApiTokenDocument)
+        return translateToApiToken(doc)
       } catch (err) {
         return new UnknownRepositoryError(err)
       }
